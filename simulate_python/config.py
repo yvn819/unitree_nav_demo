@@ -17,6 +17,7 @@ ENABLE_ELASTIC_BAND: 1 # Virtual spring band, used for lifting h1
 
 PRINT_BASE_STATE = True
 PRINT_BASE_STATE_PERIOD = 0.1  # seconds
+PRINT_GOAL_UPDATES = True
 
 BASE_WAYPOINTS = [
     [0.0, 0.0, 0.0],
@@ -33,3 +34,10 @@ BASE_WAYPOINTS_RELATIVE_TO_START = True
 
 # Optional offset added after any relative shift.
 BASE_WAYPOINTS_OFFSET = [0.0, 0.0, 0.0]
+
+# Base velocity control (used when advancing along waypoints)
+BASE_YAW_RATE = 2.0  # rad/s max
+BASE_YAW_KP = 2.0
+
+# Use every Nth waypoint from CSV (and from BASE_WAYPOINTS if no CSV).
+BASE_WAYPOINT_STRIDE = 10

@@ -64,6 +64,10 @@ def _init_base_path(current_base_pos: np.ndarray):
     if len(waypoints) == 0:
         waypoints = [np.array([0.0, 0.0, 0.0], dtype=float)]
 
+    stride = int(getattr(config, "BASE_WAYPOINT_STRIDE", 1))
+    if stride > 1 and len(waypoints) > 1:
+        waypoints = waypoints[::stride]
+
     # Optionally shift waypoints so the first point starts at current base pos.
     if getattr(config, "BASE_WAYPOINTS_RELATIVE_TO_START", False):
         if len(waypoints) > 0:
@@ -128,6 +132,10 @@ def _load_viz_waypoints(current_base_pos: np.ndarray):
 
     if len(waypoints) == 0:
         return []
+
+    stride = int(getattr(path_viz, "PATH_VIZ_STRIDE", getattr(config, "BASE_WAYPOINT_STRIDE", 1)))
+    if stride > 1 and len(waypoints) > 1:
+        waypoints = waypoints[::stride]
 
     if getattr(path_viz, "PATH_VIZ_RELATIVE_TO_START", False):
         first = waypoints[0].copy()
@@ -199,12 +207,16 @@ def _update_path_viz():
 
 
 def _advance_base_along_path(dt: float):
-    # Move planar base joints (base_x, base_y, base_yaw) along waypoints.
+    # Move planar base joints (base_x, base_y, base_yaw) along waypoints using velocity control.
     if not hasattr(_advance_base_along_path, "waypoints"):
         base_x_adr, base_y_adr, base_yaw_adr = _get_base_adrs()
         _advance_base_along_path.base_x_adr = base_x_adr
         _advance_base_along_path.base_y_adr = base_y_adr
         _advance_base_along_path.base_yaw_adr = base_yaw_adr
+        vel_x_adr, vel_y_adr, vel_yaw_adr = _get_base_dof_adrs()
+        _advance_base_along_path.vel_x_adr = vel_x_adr
+        _advance_base_along_path.vel_y_adr = vel_y_adr
+        _advance_base_along_path.vel_yaw_adr = vel_yaw_adr
         _advance_base_along_path.pos = np.array(
             [
                 mj_data.qpos[base_x_adr],
@@ -223,36 +235,58 @@ def _advance_base_along_path(dt: float):
     target = _advance_base_along_path.target
     delta = target[0:2] - pos[0:2]
     dist = float(np.linalg.norm(delta))
-    if dist < 1e-3:
+    if dist < 5e-2:
         _advance_base_along_path.index = (
             _advance_base_along_path.index + 1
         ) % len(_advance_base_along_path.waypoints)
         _advance_base_along_path.target = _advance_base_along_path.waypoints[
             _advance_base_along_path.index
         ]
-        return
+        if getattr(config, "PRINT_GOAL_UPDATES", True):
+            reached = target
+            next_target = _advance_base_along_path.target
+            print(
+                "goal reached: x={:.3f} y={:.3f} yaw={:.3f} -> next: x={:.3f} y={:.3f} yaw={:.3f}".format(
+                    float(reached[0]),
+                    float(reached[1]),
+                    float(reached[2]) if reached.size >= 3 else 0.0,
+                    float(next_target[0]),
+                    float(next_target[1]),
+                    float(next_target[2]) if next_target.size >= 3 else 0.0,
+                )
+            )
+        target = _advance_base_along_path.target
+        delta = target[0:2] - pos[0:2]
+        dist = float(np.linalg.norm(delta))
 
-    speed = getattr(config, "BASE_SPEED", 3)
-    step = speed * dt
-    if step > dist:
-        pos[0:2] = target[0:2]
-    else:
-        pos[0:2] = pos[0:2] + (delta / dist) * step
+    # Command planar velocities toward target.
+    speed = float(getattr(config, "BASE_SPEED", 3.0))
+    dir_xy = delta / max(dist, 1e-6)
+    vx = dir_xy[0] * speed
+    vy = dir_xy[1] * speed
 
-    mj_data.qpos[_advance_base_along_path.base_x_adr] = pos[0]
-    mj_data.qpos[_advance_base_along_path.base_y_adr] = pos[1]
-
-    # Yaw: use waypoint yaw if provided, otherwise optional auto-follow.
+    # Yaw control: use waypoint yaw if provided, otherwise optional auto-follow.
+    yaw_now = float(mj_data.qpos[_advance_base_along_path.base_yaw_adr])
     if target.size >= 3:
-        mj_data.qpos[_advance_base_along_path.base_yaw_adr] = float(target[2])
+        yaw_target = float(target[2])
     elif getattr(config, "BASE_YAW_FOLLOW", False):
-        yaw = float(np.arctan2(delta[1], delta[0]))
-        mj_data.qpos[_advance_base_along_path.base_yaw_adr] = yaw
+        yaw_target = float(np.arctan2(delta[1], delta[0]))
+    else:
+        yaw_target = yaw_now
 
-    # Zero base velocities so dynamics don't fight the teleport
-    mj_data.qvel[_advance_base_along_path.base_x_adr] = 0.0
-    mj_data.qvel[_advance_base_along_path.base_y_adr] = 0.0
-    mj_data.qvel[_advance_base_along_path.base_yaw_adr] = 0.0
+    def _wrap_pi(a: float) -> float:
+        return (a + np.pi) % (2.0 * np.pi) - np.pi
+
+    yaw_err = _wrap_pi(yaw_target - yaw_now)
+    yaw_rate_max = float(getattr(config, "BASE_YAW_RATE", 2.0))
+    yaw_rate = np.clip(yaw_err * float(getattr(config, "BASE_YAW_KP", 2.0)), -yaw_rate_max, yaw_rate_max)
+
+    mj_data.qvel[_advance_base_along_path.vel_x_adr] = vx
+    mj_data.qvel[_advance_base_along_path.vel_y_adr] = vy
+    mj_data.qvel[_advance_base_along_path.vel_yaw_adr] = yaw_rate
+
+    # Update cached position estimate (Mujoco will integrate, but we keep a local copy for distance check).
+    pos[0:2] = mj_data.qpos[_advance_base_along_path.base_x_adr:_advance_base_along_path.base_x_adr + 2]
 
 def SimulationThread():
     global mj_data, mj_model
